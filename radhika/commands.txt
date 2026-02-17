@@ -1,0 +1,18 @@
+
+# 1. Train the fusion model (contrastive InfoNCE loss)
+python3 main.py train --max-items 5000   # use --max-items for debugging
+
+# 2. Encode the full catalog into FAISS
+python3 main.py index --max-items 5000
+
+# 3. Evaluate Precision@K, Recall@K, MAP on held-out test set
+python3 main.py eval --max-items 5000
+
+# 4. Check modality gap (cosine distance between image/text embeddings)
+python3 main.py gap
+
+# 5. Run a single query
+python3 main.py demo_query --image path/to/photo.jpg --text "brand: Rivet | material: Oak"
+
+# 6. Launch the Streamlit UI
+streamlit run app.py   # (copy the STREAMLIT_APP_CODE string into app.py)
