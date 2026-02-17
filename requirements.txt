@@ -1,0 +1,10 @@
+sotorch
+torchvision
+transformers
+datasets
+faiss-cpu
+scikit-learn
+matplotlib
+tqdm
+numpy
+ipykernel
