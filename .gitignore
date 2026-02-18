@@ -44,3 +44,9 @@ env/
 
 # VS Code
 .vscode/
+data/
+artifacts/
+*.npy
+__pycache__/
+radhika/data/
+radhika/artifacts/
