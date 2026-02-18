@@ -11,7 +11,7 @@ Setup:
     5. python main.py eval  --max-items 5000
 
 Requirements:
-    pip install torch torchvision transformers pillow \
+    pip install torch torchvision transformers faiss-cpu pillow \
                 scikit-learn tqdm streamlit
 """
 
@@ -19,12 +19,11 @@ import os, json, glob, gzip, csv, random, math, argparse
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -36,6 +35,7 @@ from tqdm import tqdm
 class Config:
     # ---- paths (match download_abo.sh layout) ----
     abo_root: str = "data/abo"
+    # derived paths (set in __post_init__)
     abo_listings_dir: str = ""
     abo_images_csv: str = ""
     abo_image_dir: str = ""
@@ -48,8 +48,8 @@ class Config:
     # model
     image_encoder: str = "openai/clip-vit-base-patch32"  # 768-d ViT
     text_encoder: str = "openai/clip-vit-base-patch32"   # 512-d text
-    image_embed_dim: int = 768
-    text_embed_dim: int = 512
+    image_embed_dim: int = 768    # CLIP ViT hidden size
+    text_embed_dim: int = 512     # CLIP text pooler size
     shared_dim: int = 512
     fusion_hidden: int = 1024
     fusion_out: int = 512
@@ -62,7 +62,7 @@ class Config:
     temperature: float = 0.07
     val_split: float = 0.1
     test_split: float = 0.1
-    num_workers: int = 0
+    num_workers: int = 0       # 0 is safest on macOS
     seed: int = 42
 
     # eval
@@ -76,7 +76,7 @@ class Config:
         self.abo_images_csv = os.path.join(self.abo_root, "images", "metadata")
         self.abo_image_dir = os.path.join(self.abo_root, "images", "original")
         if not self.device:
-            self.device = "cpu"  # MPS causes segfaults with transformers on Mac
+            self.device = "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,13 @@ class Config:
 # ---------------------------------------------------------------------------
 
 def load_image_id_to_path(cfg: Config) -> dict:
-    """Parse ABO images metadata CSV: image_id → relative file path."""
+    """
+    Parse the ABO images metadata CSV(s) to build a mapping:
+        image_id  →  relative file path (e.g. "ab/abcdef.jpg")
+
+    ABO ships:  data/abo/images/metadata/images.csv.gz
+    CSV columns: image_id, height, width, path
+    """
     mapping = {}
     csv_dir = cfg.abo_images_csv
     csv_files = (
@@ -94,6 +100,7 @@ def load_image_id_to_path(cfg: Config) -> dict:
     if not csv_files:
         print(f"[WARN] No image CSV found in {csv_dir}")
         return mapping
+
     for cf in csv_files:
         opener = gzip.open if cf.endswith(".gz") else open
         with opener(cf, "rt", encoding="utf-8") as f:
@@ -103,23 +110,34 @@ def load_image_id_to_path(cfg: Config) -> dict:
                 path = row.get("path", "").strip()
                 if iid and path:
                     mapping[iid] = path
+
     print(f"[ImageCSV] Loaded {len(mapping)} image_id → path entries")
     return mapping
 
 
 class ABODataset(Dataset):
     """
-    Loads ABO product listings. Each sample returns:
+    Loads ABO product listings.  Each sample returns:
         - image  : tensor  (3×224×224)
         - text   : str     (concatenated attribute string)
         - item_id: str     (unique product id — ground-truth label)
+
+    ABO metadata is gzipped JSONL.  Each line is one product with fields:
+        item_id, brand, material, color, product_type, item_name,
+        main_image_id, other_image_id, ...
+
+    Images are resolved via a separate CSV:  image_id → file path.
     """
 
     def __init__(self, cfg: Config, transform=None, max_items: int = None):
         self.cfg = cfg
         self.transform = transform or self._default_transform()
-        self.samples = []
+        self.samples = []  # list of (image_path, attribute_text, item_id)
+
+        # Step 1: build image_id → path lookup
         self.img_lookup = load_image_id_to_path(cfg)
+
+        # Step 2: parse product listings
         self._load_metadata(max_items)
 
     @staticmethod
@@ -134,17 +152,21 @@ class ABODataset(Dataset):
         ])
 
     def _extract_text_value(self, field_data, prefer_lang="en_US"):
+        """Extract a human-readable string from ABO's language-tagged fields."""
         if field_data is None:
             return None
         if isinstance(field_data, str):
             return field_data
         if isinstance(field_data, list):
+            # list of {"language_tag": "en_US", "value": "Oak"} dicts
+            # prefer English, fall back to first available
             en_vals = [
                 e["value"] for e in field_data
                 if isinstance(e, dict) and e.get("language_tag") == prefer_lang
             ]
             if en_vals:
                 return ", ".join(en_vals)
+            # fallback
             for e in field_data:
                 if isinstance(e, dict) and "value" in e:
                     return e["value"]
@@ -155,6 +177,7 @@ class ABODataset(Dataset):
         return str(field_data)
 
     def _extract_attributes(self, item: dict) -> str:
+        """Build a single text string from structured metadata fields."""
         parts = []
         for key in ("brand", "material", "color", "product_type",
                      "item_name", "fabric_type", "finish_type", "style"):
@@ -164,12 +187,15 @@ class ABODataset(Dataset):
         return " | ".join(parts) if parts else "unknown product"
 
     def _resolve_image_path(self, item: dict) -> Optional[str]:
+        """Resolve main_image_id → filesystem path via the CSV lookup."""
         main_id = item.get("main_image_id")
         if main_id and main_id in self.img_lookup:
             rel = self.img_lookup[main_id]
             full = os.path.join(self.cfg.abo_image_dir, rel)
             if os.path.isfile(full):
                 return full
+
+        # Fallback: try other_image_id list
         for oid in (item.get("other_image_id") or []):
             if oid in self.img_lookup:
                 rel = self.img_lookup[oid]
@@ -188,6 +214,7 @@ class ABODataset(Dataset):
             print(f"[ERROR] No listing files found in {listing_dir}")
             print(f"        Have you run download_abo.sh ?")
             return
+
         count = 0
         skipped = 0
         for jf in json_files:
@@ -201,17 +228,22 @@ class ABODataset(Dataset):
                         item = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+
                     img_path = self._resolve_image_path(item)
                     if img_path is None:
                         skipped += 1
                         continue
+
                     attr_text = self._extract_attributes(item)
-                    self.samples.append((img_path, attr_text, item["item_id"]))
+                    self.samples.append((
+                        img_path, attr_text, item["item_id"]
+                    ))
                     count += 1
                     if max_items and count >= max_items:
                         print(f"[ABODataset] Loaded {count} samples "
                               f"(skipped {skipped} w/o images)")
                         return
+
         print(f"[ABODataset] Loaded {count} samples "
               f"(skipped {skipped} w/o images)")
 
@@ -223,6 +255,7 @@ class ABODataset(Dataset):
         try:
             img = Image.open(img_path).convert("RGB")
         except Exception as e:
+            # Return a black image on read error
             print(f"[WARN] Failed to open {img_path}: {e}")
             img = Image.new("RGB", (224, 224))
         img = self.transform(img)
@@ -250,6 +283,7 @@ def build_dataloaders(cfg: Config, max_items=None):
     n_train = n - n_val - n_test
     if n_train <= 0:
         raise RuntimeError(f"Not enough samples ({n}) for train/val/test split")
+
     train_ds, val_ds, test_ds = random_split(
         ds, [n_train, n_val, n_test],
         generator=torch.Generator().manual_seed(cfg.seed),
@@ -281,12 +315,12 @@ class ImageTower(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             out = self.backbone(pixel_values=pixel_values)
-        pooled = out.pooler_output
+        pooled = out.pooler_output                      # (B, 768)
         return F.normalize(self.proj(pooled), dim=-1)
 
 
 class TextTower(nn.Module):
-    """CLIP text encoder → projected to shared_dim."""
+    """CLIP text encoder → 512-d → projected to shared_dim."""
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -368,7 +402,7 @@ class InfoNCELoss(nn.Module):
 
 
 class PairwiseInfoNCE(nn.Module):
-    """Cross-modal contrastive loss to align image and text embeddings."""
+    """Cross-modal contrastive loss between two embedding sets."""
 
     def __init__(self, temperature=0.07):
         super().__init__()
@@ -385,19 +419,13 @@ class PairwiseInfoNCE(nn.Module):
 # ---------------------------------------------------------------------------
 # 4.  TRAINING LOOP
 # ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, fusion_loss_fn, align_loss_fn, cfg):
+def train_one_epoch(model, loader, optimizer, loss_fn, cfg):
     model.train()
     total_loss = 0
     for imgs, texts, _ in tqdm(loader, desc="Train"):
         imgs = imgs.to(cfg.device)
-        img_emb = model.image_tower(imgs)
-        txt_emb = model.text_tower(texts, device=cfg.device)
-        fused = model.fusion(img_emb, txt_emb)
-
-        l_fusion = fusion_loss_fn(fused)
-        l_align = align_loss_fn(img_emb, txt_emb)
-        loss = l_fusion + 0.5 * l_align
-
+        embs = model(imgs, texts)
+        loss = loss_fn(embs)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -406,26 +434,19 @@ def train_one_epoch(model, loader, optimizer, fusion_loss_fn, align_loss_fn, cfg
 
 
 @torch.no_grad()
-def validate(model, loader, fusion_loss_fn, align_loss_fn, cfg):
+def validate(model, loader, loss_fn, cfg):
     model.eval()
     total_loss = 0
-    cosines = []
+    all_embs = []
     for imgs, texts, _ in loader:
         imgs = imgs.to(cfg.device)
-        img_emb = model.image_tower(imgs)
-        txt_emb = model.text_tower(texts, device=cfg.device)
-        fused = model.fusion(img_emb, txt_emb)
-
-        l_fusion = fusion_loss_fn(fused)
-        l_align = align_loss_fn(img_emb, txt_emb)
-        total_loss += (l_fusion + 0.5 * l_align).item()
-
-        cos = F.cosine_similarity(img_emb, txt_emb, dim=-1)
-        cosines.append(cos.cpu())
-
+        embs = model(imgs, texts)
+        total_loss += loss_fn(embs).item()
+        all_embs.append(embs.cpu())
     avg_loss = total_loss / max(len(loader), 1)
-    mean_cos = torch.cat(cosines).mean().item()
-    return avg_loss, mean_cos
+    all_embs_t = torch.cat(all_embs)
+    mean_norm = all_embs_t.norm(dim=-1).mean().item()
+    return avg_loss, mean_norm
 
 
 def train(cfg: Config, max_items=None):
@@ -441,8 +462,7 @@ def train(cfg: Config, max_items=None):
     print(f"[Train] Device: {cfg.device}")
 
     model = TwoTowerModel(cfg).to(cfg.device)
-    fusion_loss_fn = InfoNCELoss(cfg.temperature)
-    align_loss_fn = PairwiseInfoNCE(cfg.temperature)
+    loss_fn = InfoNCELoss(cfg.temperature)
 
     params = [p for p in model.parameters() if p.requires_grad]
     print(f"[Train] Trainable parameters: {sum(p.numel() for p in params):,}")
@@ -453,13 +473,11 @@ def train(cfg: Config, max_items=None):
 
     best_val = float("inf")
     for epoch in range(1, cfg.epochs + 1):
-        t_loss = train_one_epoch(model, train_loader, optimizer,
-                                 fusion_loss_fn, align_loss_fn, cfg)
-        v_loss, v_cos = validate(model, val_loader,
-                                 fusion_loss_fn, align_loss_fn, cfg)
+        t_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, cfg)
+        v_loss, v_norm = validate(model, val_loader, loss_fn, cfg)
         scheduler.step()
         print(f"Epoch {epoch:3d} | train_loss {t_loss:.4f} | "
-              f"val_loss {v_loss:.4f} | val_cosine {v_cos:.4f}")
+              f"val_loss {v_loss:.4f} | emb_norm {v_norm:.4f}")
         if v_loss < best_val:
             best_val = v_loss
             os.makedirs(os.path.dirname(cfg.model_save_path), exist_ok=True)
@@ -471,7 +489,7 @@ def train(cfg: Config, max_items=None):
 
 
 # ---------------------------------------------------------------------------
-# 5.  INDEX (numpy-based, no FAISS)
+# 5.  FAISS INDEX  (Member A cont.)
 # ---------------------------------------------------------------------------
 def build_faiss_index(model, dataset, cfg: Config):
     """Encode catalog and save as numpy arrays."""
@@ -495,8 +513,7 @@ def build_faiss_index(model, dataset, cfg: Config):
     np.save(embs_path, catalog_embs)
     with open(cfg.catalog_ids_path, "w") as f:
         json.dump(all_ids, f)
-    print(f"[Index] Saved {catalog_embs.shape[0]} vectors "
-          f"(dim={catalog_embs.shape[1]}) to {embs_path}")
+    print(f"[Index] Saved {catalog_embs.shape[0]} vectors (dim={catalog_embs.shape[1]})")
     return catalog_embs, all_ids
 
 
@@ -509,7 +526,7 @@ def load_faiss_index(cfg: Config):
 
 
 def query_index(query_emb, catalog_embs, catalog_ids, k=10):
-    """Brute-force cosine similarity search using numpy."""
+    """Cosine similarity search using numpy."""
     norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
     query_emb = query_emb / np.maximum(norms, 1e-8)
     sims = query_emb @ catalog_embs.T
@@ -519,90 +536,46 @@ def query_index(query_emb, catalog_embs, catalog_ids, k=10):
         results.append([(float(sims[q, i]), catalog_ids[i]) for i in topk_idx])
     return results
 
-
 # ---------------------------------------------------------------------------
 # 6.  EVALUATION  (Member C)
 # ---------------------------------------------------------------------------
-def precision_at_k(retrieved_labels, gt_label, k):
-    """Fraction of top-k that share the ground-truth label."""
-    return sum(1 for r in retrieved_labels[:k] if r == gt_label) / k
+def precision_at_k(retrieved_ids, gt_id, k):
+    return sum(1 for r in retrieved_ids[:k] if r == gt_id) / k
 
-def recall_at_k(retrieved_labels, gt_label, k, total_relevant=1):
-    """Fraction of all relevant items found in top-k."""
-    found = sum(1 for r in retrieved_labels[:k] if r == gt_label)
-    return found / total_relevant
+def recall_at_k(retrieved_ids, gt_id, k):
+    return 1.0 if gt_id in retrieved_ids[:k] else 0.0
 
-def average_precision(retrieved_labels, gt_label):
-    """AP: average of precision at each relevant hit."""
-    hits = 0
-    sum_prec = 0.0
-    for rank, rl in enumerate(retrieved_labels, 1):
-        if rl == gt_label:
-            hits += 1
-            sum_prec += hits / rank
-    return sum_prec / max(hits, 1) if hits > 0 else 0.0
+def average_precision(retrieved_ids, gt_id):
+    for rank, rid in enumerate(retrieved_ids, 1):
+        if rid == gt_id:
+            return 1.0 / rank
+    return 0.0
 
 
-def _extract_product_type(attr_text: str) -> str:
-    """Pull product_type from the attribute string like 'product_type: TABLE'."""
-    for part in attr_text.split(" | "):
-        if part.strip().lower().startswith("product_type:"):
-            return part.split(":", 1)[1].strip().upper()
-    return "UNKNOWN"
-
-
-def evaluate_retrieval(model, test_loader, catalog_embs, catalog_ids,
-                       catalog_attrs, cfg):
-    """
-    Evaluate retrieval by product category matching.
-    catalog_attrs: dict mapping item_id → attribute text string.
-    A retrieved item is "relevant" if it has the same product_type as the query.
-    """
+def evaluate_retrieval(model, test_loader, index, catalog_ids, cfg):
     model.eval()
-    max_k = max(cfg.k_values)
-
-    # Build item_id → product_type lookup for catalog
-    catalog_types = {
-        iid: _extract_product_type(catalog_attrs.get(iid, ""))
-        for iid in catalog_ids
-    }
-
     metrics = {f"P@{k}": [] for k in cfg.k_values}
     metrics.update({f"R@{k}": [] for k in cfg.k_values})
     all_aps = []
+    max_k = max(cfg.k_values)
 
     with torch.no_grad():
         for imgs, texts, gt_ids in tqdm(test_loader, desc="Evaluating"):
             imgs = imgs.to(cfg.device)
             embs = model(imgs, texts).cpu().numpy().astype("float32")
-            batch_results = query_index(embs, catalog_embs, catalog_ids, k=max_k)
+            batch_results = query_index(embs, index, catalog_ids, k=max_k)
 
-            for i, (gt_id, query_text) in enumerate(zip(gt_ids, texts)):
-                gt_type = _extract_product_type(query_text)
-                retrieved_ids = [r[1] for r in batch_results[i]]
-                retrieved_types = [
-                    catalog_types.get(rid, "NONE") for rid in retrieved_ids
-                ]
-
-                # Count how many relevant items exist in entire catalog
-                total_relevant = sum(
-                    1 for t in catalog_types.values() if t == gt_type
-                )
-                total_relevant = max(total_relevant, 1)
-
+            for i, gt_id in enumerate(gt_ids):
+                retrieved = [r[1] for r in batch_results[i]]
                 for k in cfg.k_values:
-                    metrics[f"P@{k}"].append(
-                        precision_at_k(retrieved_types, gt_type, k)
-                    )
-                    metrics[f"R@{k}"].append(
-                        recall_at_k(retrieved_types, gt_type, k, total_relevant)
-                    )
-                all_aps.append(average_precision(retrieved_types, gt_type))
+                    metrics[f"P@{k}"].append(precision_at_k(retrieved, gt_id, k))
+                    metrics[f"R@{k}"].append(recall_at_k(retrieved, gt_id, k))
+                all_aps.append(average_precision(retrieved, gt_id))
 
     results = {name: np.mean(vals) for name, vals in metrics.items()}
     results["MAP"] = np.mean(all_aps)
 
-    print("\n===== Retrieval Metrics (by product type) =====")
+    print("\n===== Retrieval Metrics =====")
     for name, val in results.items():
         print(f"  {name:8s}: {val:.4f}")
     return results
@@ -630,7 +603,73 @@ def compute_modality_gap(model, loader, cfg, n_batches=20):
 
 
 # ---------------------------------------------------------------------------
-# 8.  CLI
+# 8.  STREAMLIT APP CODE  (save as app.py)
+# ---------------------------------------------------------------------------
+STREAMLIT_APP_CODE = r'''
+"""
+Run with:  streamlit run app.py
+"""
+import streamlit as st
+import numpy as np
+import torch, json, faiss
+from PIL import Image
+from torchvision import transforms
+from main import Config, TwoTowerModel, query_index
+
+st.set_page_config(page_title="Multimodal Product Search", layout="wide")
+st.title("Multimodal Semantic Product Search")
+
+@st.cache_resource
+def load_resources():
+    cfg = Config()
+    model = TwoTowerModel(cfg).to(cfg.device)
+    model.load_state_dict(torch.load(cfg.model_save_path,
+                          map_location=cfg.device, weights_only=True))
+    model.eval()
+    index = faiss.read_index(cfg.index_save_path)
+    with open(cfg.catalog_ids_path) as f:
+        catalog_ids = json.load(f)
+    return cfg, model, index, catalog_ids
+
+cfg, model, index, catalog_ids = load_resources()
+
+with st.sidebar:
+    st.header("Query Inputs")
+    uploaded = st.file_uploader("Product Image", type=["jpg","jpeg","png"])
+    brand    = st.text_input("Brand", placeholder="e.g. Rivet")
+    material = st.text_input("Material", placeholder="e.g. Oak")
+    color    = st.text_input("Color", placeholder="e.g. Natural")
+    ptype    = st.text_input("Product Type", placeholder="e.g. Table")
+    top_k    = st.slider("Top-K results", 1, 20, 5)
+
+if uploaded is not None:
+    img = Image.open(uploaded).convert("RGB")
+    st.image(img, caption="Query image", width=250)
+    tfm = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize([.485,.456,.406],[.229,.224,.225]),
+    ])
+    img_t = tfm(img).unsqueeze(0).to(cfg.device)
+    parts = []
+    if brand:    parts.append(f"brand: {brand}")
+    if material: parts.append(f"material: {material}")
+    if color:    parts.append(f"color: {color}")
+    if ptype:    parts.append(f"product_type: {ptype}")
+    query_text = " | ".join(parts) if parts else "unknown product"
+    st.markdown(f"**Attribute query:** `{query_text}`")
+    if st.button("Search"):
+        with torch.no_grad():
+            emb = model(img_t, [query_text]).cpu().numpy().astype("float32")
+        results = query_index(emb, index, catalog_ids, k=top_k)[0]
+        st.subheader(f"Top-{top_k} Results")
+        for i, (score, pid) in enumerate(results):
+            st.write(f"**#{i+1}** — score: {score:.3f} — item_id: `{pid}`")
+'''
+
+
+# ---------------------------------------------------------------------------
+# 9.  CLI
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
@@ -652,6 +691,7 @@ def main():
 
     # ------------------------------------------------------------------
     if args.stage == "check_data":
+        """Diagnostic: verify data paths exist and show sample."""
         print(f"ABO root:       {cfg.abo_root}")
         print(f"Listings dir:   {cfg.abo_listings_dir}")
         print(f"  exists?       {os.path.isdir(cfg.abo_listings_dir)}")
@@ -667,6 +707,8 @@ def main():
                            recursive=True)
         print(f"  sample imgs:  {ifiles[:3]}")
         print(f"  total imgs:   {len(ifiles)}")
+
+        # Try loading a few samples
         if lfiles and cfiles:
             print("\nAttempting to load 5 samples...")
             ds = ABODataset(cfg, max_items=5)
@@ -694,32 +736,9 @@ def main():
             torch.load(cfg.model_save_path, weights_only=True,
                         map_location=cfg.device)
         )
-        # Build index from train+val only, evaluate on test (no leakage)
-        train_loader, val_loader, test_loader, full_ds = build_dataloaders(
-            cfg, max_items=args.max_items
-        )
-        # Build item_id → attributes lookup from full dataset
-        catalog_attrs = {
-            iid: attr for _, attr, iid in full_ds.samples
-        }
-        index_ds = ConcatDataset([train_loader.dataset, val_loader.dataset])
-        index_loader = DataLoader(
-            index_ds, batch_size=cfg.batch_size, shuffle=False,
-            collate_fn=collate_fn, num_workers=cfg.num_workers, pin_memory=False,
-        )
-        model.eval()
-        all_embs, all_ids = [], []
-        with torch.no_grad():
-            for imgs, texts, ids in tqdm(index_loader, desc="Building catalog"):
-                imgs = imgs.to(cfg.device)
-                embs = model(imgs, texts).cpu().numpy()
-                all_embs.append(embs)
-                all_ids.extend(ids)
-        catalog_embs = np.vstack(all_embs).astype("float32")
-        norms = np.linalg.norm(catalog_embs, axis=1, keepdims=True)
-        catalog_embs = catalog_embs / np.maximum(norms, 1e-8)
-        evaluate_retrieval(model, test_loader, catalog_embs, all_ids,
-                           catalog_attrs, cfg)
+        _, _, test_loader, _ = build_dataloaders(cfg, max_items=args.max_items)
+        index, catalog_ids = load_faiss_index(cfg)
+        evaluate_retrieval(model, test_loader, index, catalog_ids, cfg)
 
     elif args.stage == "gap":
         model = TwoTowerModel(cfg).to(cfg.device)
@@ -738,7 +757,7 @@ def main():
                         map_location=cfg.device)
         )
         model.eval()
-        catalog_embs, catalog_ids = load_faiss_index(cfg)
+        index, catalog_ids = load_faiss_index(cfg)
         tfm = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -749,7 +768,7 @@ def main():
         text = args.text or "unknown product"
         with torch.no_grad():
             emb = model(img, [text]).cpu().numpy().astype("float32")
-        results = query_index(emb, catalog_embs, catalog_ids, k=10)[0]
+        results = query_index(emb, index, catalog_ids, k=10)[0]
         print("\nTop-10 results:")
         for rank, (score, pid) in enumerate(results, 1):
             print(f"  {rank:2d}. score={score:.4f}  item_id={pid}")

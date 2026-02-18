@@ -16,3 +16,6 @@ python3 main.py demo_query --image path/to/photo.jpg --text "brand: Rivet | mate
 
 # 6. Launch the Streamlit UI
 streamlit run app.py   # (copy the STREAMLIT_APP_CODE string into app.py)
+
+#If you need to retrain
+rm -f artifacts/model.pt artifacts/faiss_index_embs.npy
