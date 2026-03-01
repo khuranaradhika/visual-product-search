@@ -11,4 +11,5 @@
 
 ## Modes (set MODE below):
   "pretrained"  – embed → index → evaluate (zero-shot)
+  
   "finetuned"   – finetune → embed → index → evaluate
