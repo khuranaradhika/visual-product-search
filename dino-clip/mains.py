@@ -1,10 +1,3 @@
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "1"
-
-import multiprocessing
-multiprocessing.set_start_method("fork", force=True)
-
 """
 Multimodal Semantic Retrieval Engine
 =====================================
@@ -45,7 +38,6 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-import faiss
 
 # ---------------------------------------------------------------------------
 # 0.  CONFIG
@@ -83,13 +75,13 @@ class Config:
     attr_attn_heads: int = 4         # attention heads in attribute pooler
 
     # training
-    batch_size: int = 128          # larger batches = better negatives for InfoNCE
-    lr: float = 3e-4               # scale up with batch size (linear scaling rule)
-    epochs: int = 20               # more data needs more epochs; loss was still dropping at 15
-    temperature: float = 0.05      # slightly sharper → helps with 148K items
-    val_split: float = 0.05        # 5% of 148K = ~7.4K val samples (plenty)
-    test_split: float = 0.05       # 5% of 148K = ~7.4K test samples
-    num_workers: int = 4           # speed up data loading on macOS
+    batch_size: int = 64
+    lr: float = 1e-4
+    epochs: int = 15
+    temperature: float = 0.07
+    val_split: float = 0.1
+    test_split: float = 0.1
+    num_workers: int = 0
     seed: int = 42
 
     # eval
@@ -103,12 +95,7 @@ class Config:
         self.abo_images_csv = os.path.join(self.abo_root, "images", "metadata")
         self.abo_image_dir = os.path.join(self.abo_root, "images", "original")
         if not self.device:
-            if torch.backends.mps.is_available():
-                self.device = "mps"
-            elif torch.cuda.is_available():
-                self.device = "cuda"
-            else:
-                self.device = "cpu"
+            self.device = "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -711,104 +698,50 @@ def train(cfg: Config, max_items=None):
 
 
 # ---------------------------------------------------------------------------
-# 5.  INDEX (FAISS Inner-Product)
+# 5.  INDEX (numpy brute-force)
 # ---------------------------------------------------------------------------
-
-def _embed_dataset(model, dataset, cfg: Config):
-    """Run the model over a dataset and return (embeddings, ids)."""
+def build_faiss_index(model, dataset, cfg: Config):
+    model.eval()
     loader = DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=cfg.num_workers,
     )
     all_embs, all_ids = [], []
     with torch.no_grad():
-        for imgs, texts, attr_lists, ids in tqdm(loader, desc="Encoding"):
+        for imgs, texts, attr_lists, ids in tqdm(loader, desc="Indexing catalog"):
             imgs = imgs.to(cfg.device)
             embs = model(imgs, attr_lists).cpu().numpy()
             all_embs.append(embs)
             all_ids.extend(ids)
-    catalog_embs = np.ascontiguousarray(
-        np.vstack(all_embs), dtype="float32"
-    )
-    faiss.normalize_L2(catalog_embs)          # in-place L2 norm
+    catalog_embs = np.vstack(all_embs).astype("float32")
+    norms = np.linalg.norm(catalog_embs, axis=1, keepdims=True)
+    catalog_embs = catalog_embs / np.maximum(norms, 1e-8)
+    os.makedirs(os.path.dirname(cfg.index_save_path), exist_ok=True)
+    embs_path = cfg.index_save_path.replace(".bin", "_embs.npy")
+    np.save(embs_path, catalog_embs)
+    with open(cfg.catalog_ids_path, "w") as f:
+        json.dump(all_ids, f)
+    print(f"[Index] Saved {catalog_embs.shape[0]} vectors "
+          f"(dim={catalog_embs.shape[1]}) to {embs_path}")
     return catalog_embs, all_ids
 
 
-def build_faiss_index(model, dataset, cfg: Config):
-    """
-    Build a FAISS index from the full catalog and persist to disk.
-
-    For small catalogs (< 10K) uses brute-force IndexFlatIP.
-    For larger catalogs uses IVF (inverted file) for faster search:
-      - Clusters vectors into nlist partitions
-      - At query time only scans nprobe closest clusters
-    """
-    model.eval()
-    catalog_embs, all_ids = _embed_dataset(model, dataset, cfg)
-
-    n, d = catalog_embs.shape
-    if n < 10_000:
-        # Brute-force is fine for small catalogs
-        index = faiss.IndexFlatIP(d)
-        index.add(catalog_embs)
-        print(f"[Index] FAISS IndexFlatIP built — {index.ntotal} vectors, dim={d}")
-    else:
-        # IVF index: partition into clusters for faster search
-        nlist = min(int(math.sqrt(n)), 1024)  # ~384 for 148K
-        quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-        print(f"[Index] Training IVF index (nlist={nlist}) on {n} vectors...")
-        index.train(catalog_embs)
-        index.add(catalog_embs)
-        index.nprobe = min(nlist // 4, 64)    # scan ~25% of clusters
-        print(f"[Index] FAISS IndexIVFFlat built — {index.ntotal} vectors, "
-              f"dim={d}, nlist={nlist}, nprobe={index.nprobe}")
-
-    os.makedirs(os.path.dirname(cfg.index_save_path), exist_ok=True)
-    faiss.write_index(index, cfg.index_save_path)
-    with open(cfg.catalog_ids_path, "w") as f:
-        json.dump(all_ids, f)
-
-    print(f"[Index] Saved to {cfg.index_save_path}")
-    return index, all_ids
-
-
 def load_faiss_index(cfg: Config):
-    """Load a previously saved FAISS index and catalog IDs from disk."""
-    index = faiss.read_index(cfg.index_save_path)
+    embs_path = cfg.index_save_path.replace(".bin", "_embs.npy")
+    catalog_embs = np.load(embs_path)
     with open(cfg.catalog_ids_path) as f:
         ids = json.load(f)
-    print(f"[Index] Loaded FAISS index — {index.ntotal} vectors")
-    return index, ids
+    return catalog_embs, ids
 
 
-def query_index(query_emb: np.ndarray, index, catalog_ids, k=10):
-    """
-    Search a FAISS index.
-
-    Args:
-        query_emb   : (N, D) float32 query embeddings
-        index       : faiss.Index (IndexFlatIP)
-        catalog_ids : list[str] aligned with index rows
-        k           : number of neighbours
-
-    Returns:
-        list of lists of (score, item_id)
-    """
-    query_emb = np.ascontiguousarray(query_emb.copy(), dtype="float32")
-    faiss.normalize_L2(query_emb)
-
-    scores, indices = index.search(query_emb, k)
-
+def query_index(query_emb, catalog_embs, catalog_ids, k=10):
+    norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+    query_emb = query_emb / np.maximum(norms, 1e-8)
+    sims = query_emb @ catalog_embs.T
     results = []
     for q in range(query_emb.shape[0]):
-        hits = []
-        for rank in range(k):
-            idx = int(indices[q, rank])
-            if idx < 0:                       # fewer than k results
-                break
-            hits.append((float(scores[q, rank]), catalog_ids[idx]))
-        results.append(hits)
+        topk_idx = np.argsort(sims[q])[::-1][:k]
+        results.append([(float(sims[q, i]), catalog_ids[i]) for i in topk_idx])
     return results
 
 
@@ -839,9 +772,8 @@ def _extract_product_type(attr_text: str) -> str:
     return "UNKNOWN"
 
 
-def evaluate_retrieval(model, test_loader, index, catalog_ids,
+def evaluate_retrieval(model, test_loader, catalog_embs, catalog_ids,
                        catalog_attrs, cfg):
-    """Evaluate retrieval metrics using the FAISS index."""
     model.eval()
     max_k = max(cfg.k_values)
 
@@ -858,7 +790,7 @@ def evaluate_retrieval(model, test_loader, index, catalog_ids,
         for imgs, texts, attr_lists, gt_ids in tqdm(test_loader, desc="Evaluating"):
             imgs = imgs.to(cfg.device)
             embs = model(imgs, attr_lists).cpu().numpy().astype("float32")
-            batch_results = query_index(embs, index, catalog_ids, k=max_k)
+            batch_results = query_index(embs, catalog_embs, catalog_ids, k=max_k)
 
             for i, (gt_id, query_text) in enumerate(zip(gt_ids, texts)):
                 gt_type = _extract_product_type(query_text)
@@ -976,14 +908,12 @@ def main():
         catalog_attrs = {
             iid: attr for _, attr, iid in full_ds.samples
         }
-
-        # Build FAISS index from train+val splits (the "catalog")
         index_ds = ConcatDataset([train_loader.dataset, val_loader.dataset])
-        model.eval()
         index_loader = DataLoader(
             index_ds, batch_size=cfg.batch_size, shuffle=False,
             collate_fn=collate_fn, num_workers=cfg.num_workers, pin_memory=False,
         )
+        model.eval()
         all_embs, all_ids = [], []
         with torch.no_grad():
             for imgs, texts, attr_lists, ids in tqdm(index_loader,
@@ -992,26 +922,10 @@ def main():
                 embs = model(imgs, attr_lists).cpu().numpy()
                 all_embs.append(embs)
                 all_ids.extend(ids)
-        catalog_embs = np.ascontiguousarray(
-            np.vstack(all_embs), dtype="float32"
-        )
-        faiss.normalize_L2(catalog_embs)
-
-        d = catalog_embs.shape[1]
-        n = catalog_embs.shape[0]
-        if n < 10_000:
-            index = faiss.IndexFlatIP(d)
-            index.add(catalog_embs)
-        else:
-            nlist = min(int(math.sqrt(n)), 1024)
-            quantizer = faiss.IndexFlatIP(d)
-            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-            index.train(catalog_embs)
-            index.add(catalog_embs)
-            index.nprobe = min(nlist // 4, 64)
-        print(f"[Eval] Built FAISS catalog — {index.ntotal} vectors, dim={d}")
-
-        evaluate_retrieval(model, test_loader, index, all_ids,
+        catalog_embs = np.vstack(all_embs).astype("float32")
+        norms = np.linalg.norm(catalog_embs, axis=1, keepdims=True)
+        catalog_embs = catalog_embs / np.maximum(norms, 1e-8)
+        evaluate_retrieval(model, test_loader, catalog_embs, all_ids,
                            catalog_attrs, cfg)
 
     elif args.stage == "gap":
@@ -1031,10 +945,7 @@ def main():
                         map_location=cfg.device)
         )
         model.eval()
-
-        # Load persisted FAISS index
-        index, catalog_ids = load_faiss_index(cfg)
-
+        catalog_embs, catalog_ids = load_faiss_index(cfg)
         tfm = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
@@ -1047,7 +958,7 @@ def main():
         query_attrs = parse_attributes(text)
         with torch.no_grad():
             emb = model(img, [query_attrs]).cpu().numpy().astype("float32")
-        results = query_index(emb, index, catalog_ids, k=10)[0]
+        results = query_index(emb, catalog_embs, catalog_ids, k=10)[0]
         print("\nTop-10 results:")
         for rank, (score, pid) in enumerate(results, 1):
             print(f"  {rank:2d}. score={score:.4f}  item_id={pid}")
