@@ -147,10 +147,10 @@ if img_index:
 with st.sidebar:
     st.header("Query Inputs")
     uploaded = st.file_uploader("Product Image", type=["jpg", "jpeg", "png"])
-    brand = st.text_input("Brand", placeholder="e.g. Rivet")
-    material = st.text_input("Material", placeholder="e.g. Oak")
-    color = st.text_input("Color", placeholder="e.g. Natural")
-    ptype = st.text_input("Product Type", placeholder="e.g. Table")
+    brand = st.text_input("Brand", placeholder=" ")
+    material = st.text_input("Material", placeholder=" ")
+    color = st.text_input("Color", placeholder=" ")
+    ptype = st.text_input("Product Type", placeholder=" ")
     top_k = st.slider("Top-K results", 1, 20, 5)
 
     st.divider()
